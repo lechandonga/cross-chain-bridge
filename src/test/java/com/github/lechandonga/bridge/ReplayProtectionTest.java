@@ -69,7 +69,7 @@ class ReplayProtectionTest {
         CrossChainMessage msg = new CrossChainMessage(unsigned.id(), unsigned.sourceChain(),
                 unsigned.targetChain(), unsigned.sender(), unsigned.nonce(), unsigned.payload(),
                 unsigned.fee(), unsigned.gasLimit(), unsigned.validFrom(), unsigned.validUntil(),
-                unsigned.retryPolicy(), "sig:alice:" + unsigned.contentHash());
+                unsigned.retryPolicy(), f.credentialOf("alice", unsigned));
         var delivery = f.prepareDelivery(msg);
         BridgeResult result = f.relayer.deliver(delivery.message(), delivery.proof(), delivery.header());
         assertEquals(RejectionReason.NOT_YET_VALID, result.reason());

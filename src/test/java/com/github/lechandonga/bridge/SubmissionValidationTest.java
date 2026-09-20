@@ -55,12 +55,10 @@ class SubmissionValidationTest {
     void invalidSignatureRejected() {
         BridgeTestFixture f = new BridgeTestFixture();
         CrossChainMessage msg = f.signedMessage("m4", "transfer:bob:100");
-        CrossChainMessage forged = new CrossChainMessage(msg.id(), msg.sourceChain(),
-                msg.targetChain(), msg.sender(), msg.nonce(), msg.payload(), msg.fee(),
-                msg.gasLimit(), msg.validFrom(), msg.validUntil(), msg.retryPolicy(),
-                "sig:mallory:" + msg.contentHash());
+        // mallory 是已注册身份，但用自己的私钥为一条声明发送方为 alice 的消息签名
+        CrossChainMessage forged = f.resignAs(msg, "mallory", "alice");
         BridgeResult result = f.bridge.submit(forged, null, null);
-        assertEquals(RejectionReason.INVALID_SIGNATURE, result.reason());
+        assertEquals(RejectionReason.CREDENTIAL_SENDER_MISMATCH, result.reason());
         assertEquals(0, f.balanceOf("bob"));
     }
 

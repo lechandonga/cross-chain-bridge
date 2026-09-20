@@ -2,6 +2,7 @@ package com.github.lechandonga.bridge;
 
 import com.github.lechandonga.bridge.bridge.BridgeResult;
 import com.github.lechandonga.bridge.chain.BlockHeader;
+import com.github.lechandonga.bridge.crypto.Signing;
 import com.github.lechandonga.bridge.lightclient.LightClient;
 import com.github.lechandonga.bridge.lightclient.MerkleProof;
 import com.github.lechandonga.bridge.model.CrossChainMessage;
@@ -37,10 +38,8 @@ class LightClientVerificationTest {
         // 篡改区块头状态根
         BlockHeader tampered = new BlockHeader(header.chainId(), header.height(),
                 header.parentHash(), "deadbeef", header.timestamp(), header.validatorSignatures());
-        // 用与篡改头匹配的签名，排除签名因素
-        BlockHeader signedTampered = new BlockHeader(tampered.chainId(), tampered.height(),
-                tampered.parentHash(), tampered.stateRoot(), tampered.timestamp(),
-                BridgeTestFixture.VALIDATORS.stream().map(v -> LightClient.sign(v, tampered)).toList());
+        // 用与篡改头匹配的真实签名，排除签名因素
+        BlockHeader signedTampered = f.signedHeader(tampered, BridgeTestFixture.VALIDATORS);
         BridgeResult result = f.bridge.submit(msg, proof, signedTampered);
         assertEquals(RejectionReason.STATE_ROOT_MISMATCH, result.reason());
         assertEquals(0, f.balanceOf("bob"));
@@ -54,9 +53,7 @@ class LightClientVerificationTest {
         BlockHeader header = f.chainA.commitBlock();
         MerkleProof proof = f.proofFor(msg);
         // 只有 1 个验证者签名，低于阈值 2
-        BlockHeader weak = new BlockHeader(header.chainId(), header.height(), header.parentHash(),
-                header.stateRoot(), header.timestamp(),
-                List.of(LightClient.sign("val1", header)));
+        BlockHeader weak = f.signedHeader(header, List.of("val1"));
         BridgeResult result = f.bridge.submit(msg, proof, weak);
         assertEquals(RejectionReason.INSUFFICIENT_VALIDATORS, result.reason());
         assertEquals(0, f.balanceOf("bob"));
@@ -70,12 +67,58 @@ class LightClientVerificationTest {
         // outbox 中登记的是另一条消息的哈希
         f.chainA.applyNow("outbox:" + msg.id(), "other-content-hash");
         BlockHeader header = f.chainA.commitBlock();
-        BlockHeader signed = new BlockHeader(header.chainId(), header.height(), header.parentHash(),
-                header.stateRoot(), header.timestamp(),
-                BridgeTestFixture.VALIDATORS.stream().map(v -> LightClient.sign(v, header)).toList());
+        BlockHeader signed = f.signedHeader(header, BridgeTestFixture.VALIDATORS);
         MerkleProof proof = f.proofFor(msg);
         BridgeResult result = f.bridge.submit(msg, proof, signed);
         assertEquals(RejectionReason.PROOF_NOT_COVERING, result.reason());
+        assertEquals(0, f.balanceOf("bob"));
+    }
+
+    @Test
+    void forgedValidatorSignatureRejected() {
+        BridgeTestFixture f = new BridgeTestFixture();
+        CrossChainMessage msg = f.signedMessage("v5", "transfer:bob:50");
+        f.chainA.applyNow("outbox:" + msg.id(), msg.contentHash());
+        BlockHeader header = f.chainA.commitBlock();
+        // 用验证者集合之外的私钥伪造签名（再配一个真实签名，凑数也不能放行）
+        var outsider = Signing.generateKeyPair();
+        String forged1 = LightClient.sign(outsider.getPrivate(), header);
+        String forged2 = LightClient.sign(Signing.generateKeyPair().getPrivate(), header);
+        BlockHeader fake = new BlockHeader(header.chainId(), header.height(), header.parentHash(),
+                header.stateRoot(), header.timestamp(), List.of(forged1, forged2));
+        MerkleProof proof = f.proofFor(msg);
+        BridgeResult result = f.bridge.submit(msg, proof, fake);
+        assertEquals(RejectionReason.CREDENTIAL_MALFORMED, result.reason(),
+                "伪造的验证者授权不能参与凑够门槛");
+        assertEquals(0, f.balanceOf("bob"));
+    }
+
+    @Test
+    void duplicatedValidatorSignatureNotCountedTwice() {
+        BridgeTestFixture f = new BridgeTestFixture();
+        CrossChainMessage msg = f.signedMessage("v6", "transfer:bob:50");
+        f.chainA.applyNow("outbox:" + msg.id(), msg.contentHash());
+        BlockHeader header = f.chainA.commitBlock();
+        MerkleProof proof = f.proofFor(msg);
+        // 同一个验证者签名出现两次：阈值是 2，重复授权不得凑数
+        String sig = LightClient.sign(f.validatorKeyOf("val1").getPrivate(), header);
+        BlockHeader duplicated = new BlockHeader(header.chainId(), header.height(),
+                header.parentHash(), header.stateRoot(), header.timestamp(), List.of(sig, sig));
+        BridgeResult result = f.bridge.submit(msg, proof, duplicated);
+        assertEquals(RejectionReason.DUPLICATE_AUTHORIZATION, result.reason());
+        assertEquals(0, f.balanceOf("bob"));
+        assertTrue(f.chainB.stateView().isEmpty());
+    }
+
+    @Test
+    void revokedSourceHeaderRejected() {
+        BridgeTestFixture f = new BridgeTestFixture();
+        CrossChainMessage msg = f.signedMessage("v7", "transfer:bob:50");
+        var delivery = f.prepareDelivery(msg);
+        // 来源链发生重组，旧区块头被标记撤销
+        f.lightClient.markHeaderRevoked(BridgeTestFixture.CHAIN_A, delivery.header());
+        BridgeResult result = f.bridge.submit(delivery.message(), delivery.proof(), delivery.header());
+        assertEquals(RejectionReason.SOURCE_HEADER_REVOKED, result.reason());
         assertEquals(0, f.balanceOf("bob"));
     }
 }

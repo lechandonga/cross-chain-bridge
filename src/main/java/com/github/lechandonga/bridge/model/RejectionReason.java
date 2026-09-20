@@ -12,6 +12,20 @@ public enum RejectionReason {
     NOT_YET_VALID,
     /** 签名无效 */
     INVALID_SIGNATURE,
+    /** 凭证无法解析或不是合法的签名数据（被篡改/格式损坏） */
+    CREDENTIAL_MALFORMED,
+    /** 凭证有效，但与声明的发送方身份不绑定（由他人密钥签发） */
+    CREDENTIAL_SENDER_MISMATCH,
+    /** 发送方身份未在桥接端点登记 */
+    UNREGISTERED_SENDER,
+    /** 授权凭证有效，但不属于注册验证者集合 */
+    AUTHORIZER_NOT_AUTHORIZED,
+    /** 同一个授权方被重复计入（重复签名不允许凑门槛） */
+    DUPLICATE_AUTHORIZER,
+    /** 来源区块头已被重组取代，不在当前正统链上 */
+    SOURCE_HEADER_SUPERSEDED,
+    /** 同一处理路径上的重入调用 */
+    REENTRANT_CALL,
     /** 证明无法覆盖目标消息 */
     PROOF_NOT_COVERING,
     /** 区块头与状态根不一致 */

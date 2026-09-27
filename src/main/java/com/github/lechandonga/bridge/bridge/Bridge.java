@@ -26,6 +26,12 @@ import java.util.logging.Logger;
  *   <li>不同线程的并发投递互斥串行，第二条命中原有的重放/状态防护，不会长时间互相阻塞。</li>
  * </ul>
  *
+ * <p>不同消息之间的共享记账（账户余额、手续费累计）由执行临界区 {@code executionLock}
+ * 保护：载荷的读-改-写与区块固化在同一串行区内完成，任意交错下最终账务都等于
+ * 各条已成功执行消息应得金额之和，且每条消息的区块快照恰好只包含自己的账务增量，
+ * 重组回滚时账务与状态同生共死。临界区仅含内存态读写与一次出块，凭证/证明等昂贵
+ * 验证均在锁外完成，互不相关的并发投递不会因此长时间互相等待。
+ *
  * <p>每一次执行（初次提交、RETRYABLE 重试、REVERTED 后重新提交）之前都重新完成完整的
  * 来源验证：凭证、来源区块头（含撤销检查）、包含证明、证明值与消息内容一致。
  */
@@ -56,6 +62,16 @@ public class Bridge {
      */
     private final Object reorgLock = new Object();
     private int inFlight = 0;
+
+    /**
+     * 账务执行临界区：把"应用载荷（余额/手续费的读-改-写）+ 固化区块"串行化。
+     * 不同消息持有不同的消息锁，若没有此临界区，并发执行会在共享记账键
+     * （balance:&lt;account&gt;、fees:collector）上互相覆盖，且各自的写入会混进
+     * 其他消息的区块快照，重组回滚时出现账务与状态撕裂。
+     * 临界区只包含几次状态读写与一次出块（纯内存操作，微秒级），凭证/证明等
+     * 昂贵验证全部在锁外完成，互不相关的并发投递不会因此长时间互相等待。
+     */
+    private final Object executionLock = new Object();
 
     /** 测试用执行切面：在真正执行（可能记账）之前回调，用于稳定复现重入时序。 */
     private volatile Consumer<CrossChainMessage> beforeExecuteHook = m -> { };
@@ -332,9 +348,13 @@ public class Bridge {
         // 测试切面在任何账务写入之前触发：切面内重入必须被识别，且不得发生任何记账
         beforeExecuteHook.accept(message);
 
-        // 原子执行：账务与状态一并写入，随后固化到新区块
-        applyPayload(message);
-        long height = commitState(id, MessageStatus.EXECUTED, message);
+        // 原子执行：账务读-改-写与状态写入、固化区块在同一临界区内完成，
+        // 保证每条消息的区块快照恰好只包含自己的账务增量（重组回滚时账务与状态同生共死）
+        long height;
+        synchronized (executionLock) {
+            applyPayload(message);
+            height = commitState(id, MessageStatus.EXECUTED, message);
+        }
         records.put(id, record.with(record.proof(), record.header(),
                 MessageStatus.EXECUTED, height, record.remainingRetries()));
         LOG.info("msg=" + id + " 执行成功: 高度=" + height + " 判定=EXECUTED");

@@ -103,6 +103,18 @@ INITIATED → SUBMITTED → VERIFIED → EXECUTED → FINALIZED
 - 消息级分段锁 + 重组屏障保证：并发投递与重组交错时最终状态唯一、可重放一致；
   同一消息在每个规范链纪元内有效执行**最多一次**，账务与手续费要么一致存在、
   要么一致回滚，不会出现半更新值。
+- **共享记账的原子性**：不同消息各有自己的消息锁，但账户余额
+  （`balance:<account>`）与手续费累计（`fees:collector`）是跨消息共享的账本。
+  `Bridge` 用执行临界区（`executionLock`）把"载荷的读-改-写 + 状态写入 + 区块固化"
+  串行化，保证：
+  - 多条不同消息并发成功执行时，每一笔都完整记账——最终手续费累计与账户余额
+    **精确等于**各条已成功执行消息应得金额之和，与交错顺序无关、反复执行结果一致，
+    不会漏记、不会被后一笔覆盖、不会只写入一半；
+  - 每条消息的区块快照恰好只包含自己的账务增量，重组回滚时账务与链上状态
+    **同生共死**：不会出现余额已变但手续费没跟上、或链上状态与桥接记录对不上的
+    撕裂结果，同一笔有效执行也不会被重复计入；
+  - 临界区只含内存态读写与一次出块（微秒级），凭证/证明等昂贵验证全部在锁外
+    完成，互不相关的并发投递不会因此互相等待或长时间卡住。
 - 多通道乱序投递（`Relayer.deliverChannelAsync`）下，账务操作可交换，
   处理顺序不一致时最终状态一致。
 
@@ -133,10 +145,11 @@ INITIATED → SUBMITTED → VERIFIED → EXECUTED → FINALIZED
 # 编译
 mvn compile
 
-# 运行全部测试（69 个用例）
+# 运行全部测试（95 个用例）
 mvn test
 
 # 单独运行某类场景
+mvn test -Dtest=ConcurrentAccountingTest     # 并发执行的账务一致性（共享余额/手续费，含重组交错，多轮重复）
 mvn test -Dtest=CredentialSecurityTest       # 凭证不可伪造：篡改/身份不一致/复用
 mvn test -Dtest=ReentrancyTest               # 重入识别、预算不重复扣、无死锁/长阻塞
 mvn test -Dtest=ReexecutionVerificationTest  # 重试与重组后重新执行的重新来源验证

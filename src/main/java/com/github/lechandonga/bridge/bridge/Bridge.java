@@ -57,6 +57,17 @@ public class Bridge {
     private final Object reorgLock = new Object();
     private int inFlight = 0;
 
+    /**
+     * 账务临界区锁：不同消息的"载荷记账 + 状态写入 + 区块提交 + 账本登记"必须整体串行。
+     * 消息级锁只互斥同一消息，无法保护跨消息共享的记账键（balance:&lt;account&gt;、
+     * fees:collector）上的读-改-写；没有这把锁，并发执行会丢失更新，且一个消息的
+     * 写可能混入另一个消息的区块快照，重组回滚后账务与状态撕裂。
+     * 临界区内只有内存操作（微秒级），执行切面等可能较慢的段落都在临界区之外，
+     * 互不相关的并发投递不会因此长时间互相等待。
+     * 锁顺序恒为：消息锁 → ledgerLock（→ 链对象监视器），重组路径不持有 ledgerLock，不会死锁。
+     */
+    private final Object ledgerLock = new Object();
+
     /** 测试用执行切面：在真正执行（可能记账）之前回调，用于稳定复现重入时序。 */
     private volatile Consumer<CrossChainMessage> beforeExecuteHook = m -> { };
 
@@ -318,9 +329,11 @@ public class Bridge {
 
         if (message.gasLimit() < gasCost) {
             if (record.remainingRetries() > 0) {
-                records.put(id, record.with(record.proof(), record.header(),
-                        MessageStatus.RETRYABLE, -1, record.remainingRetries()));
-                writeState(id, MessageStatus.RETRYABLE, message);
+                synchronized (ledgerLock) {
+                    records.put(id, record.with(record.proof(), record.header(),
+                            MessageStatus.RETRYABLE, -1, record.remainingRetries()));
+                    writeState(id, MessageStatus.RETRYABLE, message);
+                }
                 LOG.info("msg=" + id + " 资源超限: gasLimit=" + message.gasLimit()
                         + " 需要=" + gasCost + " 判定=RETRYABLE 剩余重试=" + record.remainingRetries());
                 return BridgeResult.of(id, MessageStatus.RETRYABLE,
@@ -332,20 +345,25 @@ public class Bridge {
         // 测试切面在任何账务写入之前触发：切面内重入必须被识别，且不得发生任何记账
         beforeExecuteHook.accept(message);
 
-        // 原子执行：账务与状态一并写入，随后固化到新区块
-        applyPayload(message);
-        long height = commitState(id, MessageStatus.EXECUTED, message);
-        records.put(id, record.with(record.proof(), record.header(),
-                MessageStatus.EXECUTED, height, record.remainingRetries()));
-        LOG.info("msg=" + id + " 执行成功: 高度=" + height + " 判定=EXECUTED");
-        return BridgeResult.of(id, MessageStatus.EXECUTED, "执行成功，高度=" + height);
+        // 原子执行：账务与状态一并写入，随后固化到新区块；整段在账务临界区内完成，
+        // 保证共享记账键不丢失更新、每条消息的写入恰好落在自己的区块快照里
+        synchronized (ledgerLock) {
+            applyPayload(message);
+            long height = commitState(id, MessageStatus.EXECUTED, message);
+            records.put(id, record.with(record.proof(), record.header(),
+                    MessageStatus.EXECUTED, height, record.remainingRetries()));
+            LOG.info("msg=" + id + " 执行成功: 高度=" + height + " 判定=EXECUTED");
+            return BridgeResult.of(id, MessageStatus.EXECUTED, "执行成功，高度=" + height);
+        }
     }
 
     private BridgeResult finalizeFailure(Record record) {
         String id = record.message().id();
-        records.put(id, record.with(record.proof(), record.header(),
-                MessageStatus.FAILED_FINAL, -1, 0));
-        writeState(id, MessageStatus.FAILED_FINAL, record.message());
+        synchronized (ledgerLock) {
+            records.put(id, record.with(record.proof(), record.header(),
+                    MessageStatus.FAILED_FINAL, -1, 0));
+            writeState(id, MessageStatus.FAILED_FINAL, record.message());
+        }
         LOG.info("msg=" + id + " 重试耗尽: 判定=FAILED_FINAL 原因=" + RejectionReason.RETRIES_EXHAUSTED);
         return new BridgeResult(id, MessageStatus.FAILED_FINAL, RejectionReason.RETRIES_EXHAUSTED,
                 "重试耗尽，消息进入确定终态");

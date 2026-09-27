@@ -70,7 +70,8 @@ INITIATED → SUBMITTED → VERIFIED → EXECUTED → FINALIZED
   - 不会重复记账或重复扣减重试预算；
   - 外层处理随后仍正常完成，之后的重复投递继续走标准 `REPLAY` 口径。
 - 锁是**按消息分段**的，不使用全局大锁：不同消息可以并行推进，正常并发投递不会被
-  长时间阻塞；锁顺序恒为"消息锁 → 重组屏障"，重组不反向申请消息锁，因此无死锁。
+  长时间阻塞；投递路径的锁顺序恒为"消息锁 →（账务临界区 `ledgerLock` / 重组屏障计数）"，
+  账务锁与重组屏障互不嵌套，重组也不反向申请消息锁或账务锁，因此无死锁。
 - 测试通过 `Bridge.setBeforeExecuteHook`（执行切面向账务写入之前回调）稳定复现重入时序。
 
 ## 重新执行前必须重新验证来源
@@ -103,6 +104,17 @@ INITIATED → SUBMITTED → VERIFIED → EXECUTED → FINALIZED
 - 消息级分段锁 + 重组屏障保证：并发投递与重组交错时最终状态唯一、可重放一致；
   同一消息在每个规范链纪元内有效执行**最多一次**，账务与手续费要么一致存在、
   要么一致回滚，不会出现半更新值。
+- **账务临界区（`ledgerLock`）**：不同消息的"载荷记账 + 状态写入 + 区块提交 +
+  账本登记"整体串行。消息级锁只互斥同一消息，无法保护跨消息共享的记账键
+  （`balance:<account>`、`fees:collector`）上的读-改-写；账务临界区保证：
+  - 多条不同消息并发执行时，每一笔账都完整保留——最终余额与手续费累计**精确等于**
+    各条已成功执行消息应得金额之和，任意交错顺序、反复执行结果完全一致，
+    不会漏记、不会被后一笔覆盖、不会只写入一半；
+  - 每条消息的写入恰好落在自己的区块快照里，重组回滚按区块边界整体撤销，
+    链上状态与桥接账本同生共死，不会出现"余额变了但手续费没跟上"
+    或"链上已回滚但账本还记着"的撕裂。
+  - 临界区内只有内存操作（微秒级），来源验证、执行切面等可能较慢的段落都在
+    临界区之外，互不相关的并发投递不会因此互相等待或长时间卡住。
 - 多通道乱序投递（`Relayer.deliverChannelAsync`）下，账务操作可交换，
   处理顺序不一致时最终状态一致。
 
@@ -133,7 +145,7 @@ INITIATED → SUBMITTED → VERIFIED → EXECUTED → FINALIZED
 # 编译
 mvn compile
 
-# 运行全部测试（69 个用例）
+# 运行全部测试（86 个用例）
 mvn test
 
 # 单独运行某类场景
@@ -144,6 +156,7 @@ mvn test -Dtest=ReorgConcurrencyTest         # 重组与并发投递交错（含
 mvn test -Dtest=ReorgFinalityTest            # 重组区间判定与最终性
 mvn test -Dtest=LightClientVerificationTest  # 区块头授权与轻客户端证明
 mvn test -Dtest=ConcurrencyTest              # 多通道并发投递与顺序无关性
+mvn test -Dtest=ConcurrentLedgerConsistencyTest # 并发账务精确性：共享账户/手续费不丢更新、与重组交错不撕裂
 mvn test -Dtest=ReplayProtectionTest         # 重复投递与重放防护
 mvn test -Dtest=GasAndRetryTest              # 手续费与资源限额
 mvn test -Dtest=SubmissionValidationTest     # 提交校验
